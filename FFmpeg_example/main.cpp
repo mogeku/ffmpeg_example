@@ -86,7 +86,7 @@ typedef struct SDL_Param_T {
 /*
   return value:zero(success) non-zero(failure)
 */
-int init_ffmpeg(FFmpeg_V_Param *p_ffmpeg_param, char *filePath) {
+int init_ffmpeg(FFmpeg_V_Param *p_ffmpeg_param, const char *filePath) {
   // init FFmpeg_V_Param
   p_ffmpeg_param->pFormatCtx = avformat_alloc_context();
   const AVCodec *pCodec = NULL;
@@ -137,10 +137,10 @@ int init_ffmpeg(FFmpeg_V_Param *p_ffmpeg_param, char *filePath) {
       p_ffmpeg_param->pCodecCtx->height, AV_PIX_FMT_YUV420P, SWS_BICUBIC, NULL,
       NULL, NULL);
 
-//   av_dump_format(p_ffmpeg_param->pFormatCtx, p_ffmpeg_param->video_index,
-//                  filePath, 0);
-  av_dump_format(p_ffmpeg_param->pFormatCtx, 10,
-                 filePath, 0);
+  //   av_dump_format(p_ffmpeg_param->pFormatCtx,
+  p_ffmpeg_param->video_index,
+      //                  filePath, 0);
+      av_dump_format(p_ffmpeg_param->pFormatCtx, 10, filePath, 0);
 
   return 0;
 }
@@ -229,7 +229,7 @@ int release_sdl2(SDL_Param_T *p_sdl_param) {
   return 0;
 }
 
-int vPlayer_sdl2(char *filePath) {
+int vPlayer_sdl2(const char *filePath) {
   // ffmpeg param
   FFmpeg_V_Param *p_ffmpeg_param = NULL;
   AVPacket *packet = NULL;
@@ -330,7 +330,159 @@ end:
   return ret;
 }
 
+int my_ffplay(const string &mp4) {
+  AVFormatContext *p_fmt_ctx = NULL;
+  int ret = avformat_open_input(&p_fmt_ctx, mp4.c_str(), NULL, NULL);
+  if (ret != 0) {
+    cout << "avformat_open_input failed\n";
+    return ret;
+  }
+
+  ret = avformat_find_stream_info(p_fmt_ctx, NULL);
+  if (ret != 0) {
+    cout << "avformat_open_input failed\n";
+    return ret;
+  }
+
+  av_dump_format(p_fmt_ctx, 0, mp4.c_str(), 0);
+
+  int v_idx = -1;
+  for (auto i = 0; i < p_fmt_ctx->nb_streams; ++i) {
+    cout << "stream codec type: " << p_fmt_ctx->streams[i]->codecpar->codec_type
+         << endl;
+    if (p_fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+      v_idx = i;
+      cout << "Find a video stream, index " << v_idx << endl;
+      // break;
+    }
+  }
+  if (v_idx == -1) {
+    cout << "Not find a video stream" << endl;
+    return -1;
+  }
+
+  AVCodecParameters *p_codec_par = p_fmt_ctx->streams[v_idx]->codecpar;
+  cout << "Video codec id: " << p_codec_par->codec_id << endl;
+  const AVCodec *p_codec = avcodec_find_decoder(p_codec_par->codec_id);
+  if (p_codec == NULL) {
+    cout << "Not find a codec" << endl;
+    return -1;
+  }
+
+  AVCodecContext *p_codec_ctx = avcodec_alloc_context3(p_codec);
+  ret = avcodec_parameters_to_context(p_codec_ctx, p_codec_par);
+  if (ret != 0) {
+    cout << "avcodec_parameters_to_context failed " << ret << endl;
+    ;
+    return ret;
+  }
+
+  ret = avcodec_open2(p_codec_ctx, p_codec, NULL);
+  if (ret != 0) {
+    cout << "avcodec_open2 failed " << ret << endl;
+    return ret;
+  }
+
+  AVFrame *p_frm_raw = av_frame_alloc();
+  AVFrame *p_frm_yuv = av_frame_alloc();
+
+  int buf_size = av_image_get_buffer_size(
+      AV_PIX_FMT_YUV420P, p_codec_ctx->width, p_codec_ctx->height, 1);
+  uint8_t *buffer = (uint8_t *)av_malloc(buf_size);
+  av_image_fill_arrays(p_frm_yuv->data, p_frm_yuv->linesize, buffer,
+                       AV_PIX_FMT_YUV420P, p_codec_ctx->width,
+                       p_codec_ctx->height, 1);
+
+  SwsContext *sws_ctx = sws_getContext(p_codec_ctx->width, p_codec_ctx->height,
+                                       p_codec_ctx->pix_fmt, p_codec_ctx->width,
+                                       p_codec_ctx->height, AV_PIX_FMT_YUV420P,
+                                       SWS_BICUBIC, NULL, NULL, NULL);
+
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_TIMER)) {
+    cout << "SDL_Init failed: " << SDL_GetError() << endl;
+    return -1;
+  }
+
+  SDL_Window *screen = SDL_CreateWindow(
+      "my_ffplay Window", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+      p_codec_ctx->width, p_codec_ctx->height, SDL_WINDOW_OPENGL);
+
+  if (screen == NULL) {
+    cout << "SDL_CreateWindow failed: " << SDL_GetError() << endl;
+    return -1;
+  }
+
+  SDL_Renderer *sdl_renderer = SDL_CreateRenderer(screen, -1, 0);
+
+  SDL_Texture *sdl_texture = SDL_CreateTexture(
+      sdl_renderer, SDL_PIXELFORMAT_IYUV, SDL_TEXTUREACCESS_STREAMING,
+      p_codec_ctx->width, p_codec_ctx->height);
+
+  SDL_Rect sdl_rect;
+  sdl_rect.x = 0;
+  sdl_rect.y = 0;
+  sdl_rect.w = p_codec_ctx->width;
+  sdl_rect.h = p_codec_ctx->height;
+
+  AVPacket *p_packet = (AVPacket *)av_malloc(sizeof(AVPacket));
+
+  while (av_read_frame(p_fmt_ctx, p_packet) == 0) {
+    if (p_packet->stream_index == v_idx) {
+      ret = avcodec_send_packet(p_codec_ctx, p_packet);
+      if (ret != 0) {
+        cout << "avcodec_send_packet failed " << ret << endl;
+        return ret;
+      }
+
+      // do {
+        ret = avcodec_receive_frame(p_codec_ctx, p_frm_raw);
+        cout << ret << endl;
+        // if (ret == AVERROR_EOF) {
+        //   char e[255]{0};
+        //   av_strerror(ret, e, 255);
+        //   cout << "avcodec_receive_frame failed " << ret << ", " << e << endl;
+        //   return ret;
+        // }
+
+        if (ret == 0) {
+          sws_scale(sws_ctx, (const uint8_t *const *)p_frm_raw->data,
+                    p_frm_raw->linesize, 0, p_codec_ctx->height,
+                    p_frm_yuv->data, p_frm_yuv->linesize);
+
+          SDL_UpdateYUVTexture(sdl_texture, &sdl_rect, p_frm_yuv->data[0],
+                               p_frm_yuv->linesize[0], p_frm_yuv->data[1],
+                               p_frm_yuv->linesize[1], p_frm_yuv->data[2],
+                               p_frm_yuv->linesize[2]);
+
+          SDL_RenderClear(sdl_renderer);
+          SDL_RenderCopy(sdl_renderer, sdl_texture, NULL, &sdl_rect);
+          SDL_RenderPresent(sdl_renderer);
+
+          SDL_Delay(100);
+        }
+      // } while (ret != AVERROR(EAGAIN));
+    }
+    av_packet_unref(p_packet);
+  }
+
+  SDL_Quit();
+  sws_freeContext(sws_ctx);
+  av_free(buffer);
+  av_frame_free(&p_frm_yuv);
+  av_frame_free(&p_frm_raw);
+  avcodec_close(p_codec_ctx);
+  avformat_close_input(&p_fmt_ctx);
+
+  return ret;
+}
+
 int main() {
-  return vPlayer_sdl2(
-      R"(E:\SDK\ffmpeg\FFmpeg_SDK\FFmpeg_example\data\test.mp4)");
+  string mp4{R"(E:\Project\JupyterNotebook\Mp4Analyse\data\data1.mp4)"};
+  int ret = 0;
+
+  // vPlayer_sdl2(mp4.c_str());
+
+  ret = my_ffplay(mp4);
+
+  return ret;
 }
